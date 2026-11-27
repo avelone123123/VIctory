@@ -578,60 +578,85 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+struct SaveClock {
+    lists: Option<std::time::Instant>,
+    library: std::time::Instant,
+}
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    static SAVE: std::sync::OnceLock<Mutex<SaveClock>> = std::sync::OnceLock::new();
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+    const LIBRARY_MIN_ADDED: u64 = 32;
+    const LIBRARY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(180);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
+    let state = SAVE.get_or_init(|| {
+        Mutex::new(SaveClock {
+            lists: None,
+            library: std::time::Instant::now(),
+        })
+    });
+    let mut clock = if now {
+        state.lock().unwrap_or_else(|e| e.into_inner())
+    } else if let Ok(guard) = state.try_lock() {
+        guard
+    } else {
+        return;
+    };
+    if !now && clock.lists.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
+    }
+    let added_now = library.added.load(Ordering::Relaxed);
+    let lists_dirty = USED_CHANGED.load(Ordering::Relaxed);
+    let want_library = if now {
+        added_now > 0
+    } else {
+        clock.library.elapsed() >= SAVE_EVERY
+            && (added_now >= LIBRARY_MIN_ADDED || (added_now > 0 && clock.library.elapsed() >= LIBRARY_MAX_AGE))
+    };
+    if !want_library && !lists_dirty {
+        return;
     }
     let _saving = crate::timeline::span("pipeline: save the library and early list");
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
+        clock.lists = Some(std::time::Instant::now());
         return;
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    let bytes = if want_library {
         let _all = one_call();
-        // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
-        }
         if added == 0 {
             0
         } else {
-            // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
             let _writing = crate::timeline::span("pipeline: serialize the library to disk");
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
+                clock.lists = Some(std::time::Instant::now());
+                clock.library = std::time::Instant::now();
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
             size
         }
+    } else {
+        0
     };
-    // Through `used`: a process that asked for none yet (`victory shaders`)
-    // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 {
+        let res = replace_library(dir, &tmp);
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    } else {
+        Ok(())
+    };
     if bytes > 0 && library_written.is_ok() {
-        // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
@@ -644,10 +669,16 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
+    let took_lists = USED_CHANGED.swap(false, Ordering::Relaxed);
     let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let finished = std::time::Instant::now();
+    clock.lists = Some(finished);
+    if want_library {
+        clock.library = finished;
+    }
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -657,7 +688,12 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            if took_lists {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 

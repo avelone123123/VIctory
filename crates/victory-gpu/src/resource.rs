@@ -1276,8 +1276,15 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
-/// The share of the card's local VRAM budget in use, in percent (cached for
-/// a tenth of a second via [`crate::host::now_ms`]).
+#[cfg(windows)]
+fn video_memory_budget() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, ..]| budget)
+    })
+}
 #[cfg(windows)]
 fn video_memory_percent() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1294,11 +1301,21 @@ fn video_memory_percent() -> u64 {
     LAST.store((tenth << 8) | pct, Relaxed);
     pct
 }
-
-/// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+#[cfg(any(windows, test))]
+fn max_texture_side(vram_budget: Option<u64>, used_pct: u64) -> u64 {
+    if vram_budget.is_some_and(|budget| budget <= 6 * (1 << 30)) {
+        match used_pct {
+            0..78 => 512,
+            _ => 256,
+        }
+    } else {
+        match used_pct {
+            0..92 => 1024,
+            92..97 => 512,
+            _ => 256,
+        }
+    }
+}
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1310,11 +1327,7 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
-        _ => 256,
-    });
+    let max = set.unwrap_or_else(|| max_texture_side(video_memory_budget(), video_memory_percent()));
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
         if skip + 1 >= u32::from(desc.mip_levels) {
@@ -1751,13 +1764,12 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
-/// Unconditional host-texture floor for a given local VRAM budget (`None` when
-/// the adapter does not report one): up to 2 GiB, capped at a quarter of the
-/// reported budget so 4–6 GiB cards do not bypass the budget check early.
 #[cfg(any(windows, test))]
 fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     const MAX_FLOOR: u64 = 2 << 30;
+    const SIX_GIB: u64 = 6 << 30;
     match vram_budget {
+        Some(budget) if budget <= SIX_GIB => budget / 8,
         Some(budget) => MAX_FLOOR.min(budget / 4),
         None => MAX_FLOOR,
     }
@@ -1819,17 +1831,35 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+#[cfg(any(windows, test))]
+fn default_targets_room_mb(vram_budget: Option<u64>) -> u64 {
+    let Some(budget) = vram_budget else {
+        return 3072;
+    };
+    let budget_mb = budget >> 20;
+    if budget_mb <= 6 * 1024 {
+        (budget_mb * 3 / 8).clamp(512, 1536)
+    } else if budget_mb <= 12 * 1024 {
+        (budget_mb * 3 / 8).min(3072)
+    } else {
+        3072
+    }
+}
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
+        let fallback_mb = default_targets_room_mb(
+            crate::host::host()
+                .and_then(|h| h.video_memory())
+                .map(|[budget, ..]| budget),
+        );
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or(fallback_mb << 20, |mb| mb.min(8192) << 20)
     });
-    // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
 }
@@ -4642,12 +4672,33 @@ float4 lit() : SV_Target { return 1.0; }
     fn texture_floor_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;
         assert_eq!(texture_floor_bytes(None), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
-        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 4);
+        assert_eq!(texture_floor_bytes(Some(4 * GIB)), 4 * GIB / 8);
+        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 8);
         assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+    #[test]
+    fn over_cap_scales_with_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(max_texture_side(Some(4 * GIB), 50), 512);
+        assert_eq!(max_texture_side(Some(4 * GIB), 78), 256);
+        assert_eq!(max_texture_side(Some(8 * GIB), 50), 1024);
+        assert_eq!(max_texture_side(Some(8 * GIB), 92), 512);
+        assert_eq!(max_texture_side(Some(8 * GIB), 97), 256);
+        assert_eq!(max_texture_side(None, 50), 1024);
+    }
+    #[test]
+    fn targets_room_scales_with_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(default_targets_room_mb(None), 3072);
+        assert_eq!(default_targets_room_mb(Some(3531 * MIB)), 1324);
+        assert_eq!(default_targets_room_mb(Some(4 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(6 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(8 * GIB)), 3072);
+        assert_eq!(default_targets_room_mb(Some(24 * GIB)), 3072);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

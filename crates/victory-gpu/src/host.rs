@@ -169,11 +169,20 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 3_000;
+    const LOW_VRAM_GIB: u64 = 6 << 30;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(85) {
+    if budget <= LOW_VRAM_GIB {
+        if used < share(70) {
+            (KEPT_MS, u64::MAX)
+        } else if used < share(82) {
+            (IDLE_MS, used - share(65))
+        } else {
+            (2_000, used - share(70))
+        }
+    } else if used < share(85) {
         (KEPT_MS, u64::MAX)
     } else if used < share(93) {
         (IDLE_MS, used - share(80))
@@ -181,27 +190,18 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         (SHORT_MS, used - share(84))
     }
 }
-
-/// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
-///
-/// With room on the card nothing has to go: in session play-1125-0127 88,000
-/// of them (31 GB) went after 5 s with 7 GB of the card free, and 24,700
-/// (12 GB) had to be made and uploaded again.
-/// `VICTORY_TEXTURE_KEEP=0`: 5 s there too, as before.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     static KEEP: OnceLock<bool> = OnceLock::new();
     let keep = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0"));
     vram_idle_for(video_memory, keep)
 }
-
 fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
     const KEPT_MS: u64 = 600_000;
     const LONG_MS: u64 = 30_000;
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
+    const LOW_VRAM_GIB: u64 = 6 << 30;
     let Some([budget, used, ..]) = video_memory else {
         return NORMAL_MS;
     };
@@ -209,7 +209,19 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
         return NORMAL_MS;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
-    if used_pct >= 85 {
+    if budget <= LOW_VRAM_GIB {
+        if used_pct >= 80 {
+            HIGH_MS
+        } else if used_pct >= 68 {
+            MODERATE_MS
+        } else if !keep {
+            NORMAL_MS
+        } else if used_pct >= 58 {
+            LONG_MS
+        } else {
+            KEPT_MS
+        }
+    } else if used_pct >= 85 {
         HIGH_MS
     } else if used_pct >= 75 {
         MODERATE_MS
@@ -9933,7 +9945,6 @@ impl Host {
             None => window(width, height)?,
         };
         self.log_video_memory("right before the swap chain is made");
-        // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
@@ -10508,9 +10519,30 @@ extern "system" fn window_proc(
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+fn fullscreen_size() -> Option<(i32, i32)> {
+    let mut mode = windows::Win32::Graphics::Gdi::DEVMODEW {
+        dmSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let (dw, dh) = unsafe {
+        if windows::Win32::Graphics::Gdi::EnumDisplaySettingsW(
+            windows::core::PCWSTR::null(),
+            windows::Win32::Graphics::Gdi::ENUM_CURRENT_SETTINGS,
+            &mut mode,
+        )
+        .as_bool()
+            && mode.dmPelsWidth > 0
+            && mode.dmPelsHeight > 0
+        {
+            (mode.dmPelsWidth as i32, mode.dmPelsHeight as i32)
+        } else {
+            (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+        }
+    };
+    (dw > 0 && dh > 0).then_some((dw, dh))
+}
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
-    // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSEXW {
@@ -10522,22 +10554,35 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: width as i32,
-            bottom: height as i32,
+        let (style, x, y, w, h) = if crate::switch::on("VICTORY_FULLSCREEN")
+            && let Some((dw, dh)) = fullscreen_size()
+        {
+            (WS_POPUP | WS_VISIBLE, 0, 0, dw, dh)
+        } else {
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            };
+            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+            (
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            )
         };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            style,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(instance.into()),
@@ -11386,24 +11431,29 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let vram_idle_ms = |memory| super::vram_idle_for(memory, false);
         let keeps = |memory| super::vram_idle_for(memory, true);
         let gib = 1024 * 1024 * 1024;
-        assert_eq!(keeps(Some([100, 67, 0, 0])), 600_000);
-        assert_eq!(keeps(Some([100, 68, 0, 0])), 30_000);
-        assert_eq!(keeps(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(keeps(Some([100, 85, 0, 0])), 1_000);
+        let pct = |p: u64| Some([10 * gib, (10 * gib * p).div_ceil(100), 0, 0]);
+        assert_eq!(keeps(pct(67)), 600_000);
+        assert_eq!(keeps(pct(68)), 30_000);
+        assert_eq!(keeps(pct(75)), 2_500);
+        assert_eq!(keeps(pct(85)), 1_000);
         assert_eq!(keeps(None), 5_000);
-        // Normal (< 75%)
         assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
         assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
-        // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
-        // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
+        assert_eq!(vram_idle_ms(pct(74)), 5_000);
+        assert_eq!(vram_idle_ms(pct(75)), 2_500);
+        assert_eq!(vram_idle_ms(pct(84)), 2_500);
+        assert_eq!(vram_idle_ms(pct(85)), 1_000);
         assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
-        // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+        let pct4 = |p: u64| Some([4 * gib, (4 * gib * p).div_ceil(100), 0, 0]);
+        assert_eq!(keeps(Some([4 * gib, 2 * gib, 0, 0])), 600_000);
+        assert_eq!(keeps(pct4(58)), 30_000);
+        assert_eq!(keeps(pct4(68)), 2_500);
+        assert_eq!(keeps(pct4(80)), 1_000);
+        assert_eq!(super::vram_keep(4 * gib, (4 * gib * 69) / 100), (600_000, u64::MAX));
+        assert_eq!(super::vram_keep(4 * gib, (4 * gib * 75).div_ceil(100)).0, 5_000);
+        assert_eq!(super::vram_keep(4 * gib, (4 * gib * 85).div_ceil(100)).0, 2_000);
     }
 
     #[test]

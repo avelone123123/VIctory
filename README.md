@@ -1,103 +1,75 @@
-# VIctory on an RX 7900 XTX
+# VIctory — Low-VRAM Laptop Fork (RTX 2050 4 GB / 16 GB RAM)
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+that runs Grand Theft Auto VI (Xbox Series X|S, retail 1.0.2.1) natively on
+Windows from files the user supplies.
 
-## The goal
+This branch focuses on **getting the world (`Americas`) to boot, render, and
+progress toward playable frame rates on budget 4 GB VRAM / 16 GB RAM laptops**
+with NVIDIA GPUs.
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+## Test Hardware & Current Status (2026-11-27)
 
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+Tested on:
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
-
-## Where it stands (2026-11-26)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
-
-| | |
+| Component | Spec |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
+| OS | Windows 11 x64 |
+| GPU | NVIDIA GeForce RTX 2050 Laptop GPU (`4 GB` VRAM, `3.3 GB` DXGI local budget) |
+| CPU | Intel Core i5-11400H (11th Gen, 6C/12T @ 2.70 GHz) |
+| RAM | `16 GB` (`15.7 GB` usable) + Windows pagefile (`35+ GB` commit during world play) |
+| Game Profile | `--console series-s` (`1920x1080`, ray tracing off, `VICTORY_AMBIENT=0.8`) |
 
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
-
-### Renderer patches (off by default while they are tested)
-
-| Switch | What it does |
+| Milestone | Status |
 |---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
+| Boot & loading slides | Works (press **Enter** / **A** at the `PLAYER (A)` profile screen so `core_restofworld001.rpf` opens) |
+| Time to world (`Americas`) | `~3m 15s` with warm shader & pipeline cache |
+| World gameplay / cutscenes | Renders (`545–4,849` draws/frame), **`3–4 FPS`** (`225–352 ms/frame`, GPU `225–296 ms`) |
+| VRAM / Shared / RAM | `3.5–3.7 / 3.3 GB` VRAM, `5.2–5.6 GB` shared, `14.8–15.0 / 15.7 GB` RAM, `34.9–35.7 GB` commit |
 
-### Other switches
+## Progress Screenshots (RTX 2050 Laptop, 1920x1080)
 
-| Switch | What it does |
+> Early WIP screenshots (`3–4 FPS`): world geometry, lighting, and characters load
+> cleanly in `Americas`, while low-VRAM texture caps currently cause dark skin
+> and downscaled/missing textures in heavier outdoor scenes.
+
+| Intro car cutscene (`3 FPS`, `4849 draws`, `GPU 295.8 ms`) | Prison yard (`3 FPS`, `1444 draws`, `GPU 224.6 ms`) |
 |---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| ![Intro car cutscene at 3 FPS](docs/screenshots/01-intro-car-3fps.png) | ![Prison yard at 3 FPS](docs/screenshots/02-prison-yard-3fps.png) |
 
-What is known to be wrong:
+| Indoors cutscene (`4 FPS`, `545 draws`, `GPU 263.8 ms`, live logs) |
+|---|
+| ![Prison interior at 4 FPS with live console](docs/screenshots/03-prison-interior-4fps.png) |
 
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+## Known Issues on 4 GB VRAM / 16 GB RAM (Active Work in Progress)
 
-## How to run it
+- **Dark characters / low-res textures**: Under a `3.3 GB` DXGI VRAM budget,
+  conservative texture headroom limits (`no room for new ones`) and aggressive
+  mip caps (`256/512`) starve character skin and world surface textures in
+  outdoor scenes (`1,400+` draws).
+- **Residency wait stalls**: Aggressive `16 GB` memory-pressure thresholds trigger
+  frequent pool trimming, causing tens of thousands of synchronous `MakeResident`
+  and copy-queue mapping waits (`resident()` / `mapped()`).
+- **Commit / shared-memory spill**: When `3.3 GB` local VRAM fills, `5+ GB` spills
+  into shared system memory (`CMT ~35 GB`), requiring a large Windows pagefile.
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+## Running on Low-VRAM / 16 GB Laptops
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+copy victory.example.toml victory.toml   # set game_dir, cache_dir, data_dir outside the repo
+cargo build --release -p victory
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+Run from the repository folder (or any folder where `victory.toml` can be found by walking up from `victory.exe`):
 
-For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
-`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
-`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
-`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+```powershell
+target\release\victory.exe run --execute --console series-s <game_dir>\game_scarlett_master.exe
+```
 
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
-the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
-and `performance` selects 1920×1080. All three output 3840×2160. With
-`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
-The log reports the provider at context creation and the actual input and
-output sizes at the first successful temporal dispatch. The title profile
-and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
+Notes:
+- `--console series-s` targets `1080p` and fits a 4 GB VRAM card much better than Series X `4K`.
+- At the **`PLAYER (A)`** Xbox profile screen (~`35–50s` after launch), press **Enter** (keyboard fallback for `A`) or **A** on your controller so loading continues into `core_restofworld001.rpf`.
+- Fullscreen mode and performance switches (`VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_DESCRIPTORS=1`, `VICTORY_PORT_CBV=1`, `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`, `VICTORY_THIN=1`, `VICTORY_CARD_STEPS=2`, etc.) are applied automatically by `victory run --execute` unless `--safe` or `--windowed` is passed.
 
 On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
 high-performance adapter with Shader Model 6.6. The runtime logs its adapter

@@ -151,11 +151,12 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
-        /// Arguments for the title, after `--` (it reads the whole command
-        /// line; a title that relaunches itself passes some).
+        #[arg(long)]
+        windowed: bool,
+        #[arg(long)]
+        safe: bool,
         #[arg(last = true)]
         title_args: Vec<String>,
     },
@@ -235,8 +236,51 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            windowed,
+            safe,
             title_args,
         } => {
+            if execute {
+                if !windowed && std::env::var_os("VICTORY_FULLSCREEN").is_none() {
+                    unsafe { std::env::set_var("VICTORY_FULLSCREEN", "1") };
+                }
+                if !safe {
+                    let defaults: &[(&str, &str)] = &[
+                        ("VICTORY_TEXTURE_NO_WAIT", "1"),
+                        ("VICTORY_RELAY", "2"),
+                        ("VICTORY_WIDE_BACK", "1"),
+                        ("VICTORY_CARD_REHASH_RUNS", "1"),
+                        ("VICTORY_JOIN_COPIES", "1"),
+                        ("VICTORY_INDIRECT_WINDOW", "1"),
+                        ("VICTORY_RELAY_COPY", "1"),
+                        ("VICTORY_CARD_STEPS", "2"),
+                        ("VICTORY_INDIRECT_BATCH", "2"),
+                        ("VICTORY_MAP_THREADS", "1"),
+                        ("VICTORY_TITLE_PRIORITIES", "0"),
+                        ("VICTORY_CARD_AWAKE", "1"),
+                        ("VICTORY_SHOW_AFTER", "1"),
+                        ("VICTORY_AMBIENT", "0.8"),
+                        ("VICTORY_THIN", "1"),
+                        ("VICTORY_JOIN_PARTS", "8"),
+                        ("VICTORY_UPLOAD_AHEAD", "1"),
+                        ("VICTORY_PORT_CONSTANTS", "1"),
+                        ("VICTORY_PORT_DESCRIPTORS", "1"),
+                        ("VICTORY_PORT_CBV", "1"),
+                        ("VICTORY_PORT_GUARD", "1"),
+                        ("VICTORY_PORT_JOURNAL", "1"),
+                        ("VICTORY_RESIDENCY", "1"),
+                        ("VICTORY_RESIDENCY_LIMITED", "1"),
+                        ("VICTORY_SCREEN_WAIT_MS", "150"),
+                        ("VICTORY_PIPELINE_WAIT_MS", "50"),
+                        ("VICTORY_FRAME_INTERVAL_MS", "16.667"),
+                    ];
+                    for (key, value) in defaults {
+                        if std::env::var_os(key).is_none() {
+                            unsafe { std::env::set_var(key, value) };
+                        }
+                    }
+                }
+            }
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }

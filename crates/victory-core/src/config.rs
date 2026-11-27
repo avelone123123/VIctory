@@ -46,13 +46,25 @@ struct FilePaths {
     test_titles: Vec<PathBuf>,
 }
 
+fn default_config_path() -> PathBuf {
+    let local = PathBuf::from("victory.toml");
+    if local.is_file() {
+        return local;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for dir in exe.ancestors().skip(1) {
+            let candidate = dir.join("victory.toml");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    local
+}
 impl Config {
-    /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
         let explicit = explicit_config_path(|k| std::env::var_os(k));
-        let path = explicit
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("victory.toml"));
+        let path = explicit.clone().unwrap_or_else(default_config_path);
         let file = if path.is_file() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;

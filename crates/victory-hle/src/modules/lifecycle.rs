@@ -96,6 +96,43 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
+fn window_geometry(
+    parent: HWND,
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, u32, i32, i32, i32, i32) {
+    if parent.is_null()
+        && (style & wm::WS_CHILD) == 0
+        && width >= 640
+        && height >= 360
+        && std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1")
+    {
+        let (dw, dh) = unsafe {
+            (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN))
+        };
+        if dw > 0 && dh > 0 {
+            let ex = ex_style
+                & !(wm::WS_EX_DLGMODALFRAME
+                    | wm::WS_EX_WINDOWEDGE
+                    | wm::WS_EX_CLIENTEDGE
+                    | wm::WS_EX_STATICEDGE);
+            let st = (style
+                & !(wm::WS_CAPTION
+                    | wm::WS_THICKFRAME
+                    | wm::WS_MINIMIZEBOX
+                    | wm::WS_MAXIMIZEBOX
+                    | wm::WS_SYSMENU))
+                | wm::WS_POPUP;
+            return (ex, st, 0, 0, dw, dh);
+        }
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (ex_style, style, x, y, width, height)
+}
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -110,8 +147,8 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) =
+        window_geometry(parent, ex_style, style, x, y, width, height);
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -120,8 +157,6 @@ pub extern "system" fn CreateWindowExW(
     hook(hwnd);
     hwnd
 }
-
-/// See [`CreateWindowExW`].
 pub extern "system" fn CreateWindowExA(
     ex_style: u32,
     class: PCSTR,
@@ -136,8 +171,8 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) =
+        window_geometry(parent, ex_style, style, x, y, width, height);
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,

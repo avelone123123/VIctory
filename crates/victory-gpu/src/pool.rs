@@ -42,35 +42,60 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    let keep_cap = default_spare_kept(memory.map(|[budget, ..]| budget));
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        SPARES.store(spares_for(memory, crate::host::keep_freed(), keep_cap), Ordering::Relaxed);
         return;
     }
-    // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
-    // spares while the system is short of memory, and idle blocks let go now,
-    // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limit = spares_for(memory, crate::host::keep_freed() && !pressure, keep_cap);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
-        } else {
-            limit
-        };
+        let staging_cap = if crate::residency::limited_host_ram() { 2 } else { STAGING_KEPT };
+        let staging_limit = staging_spare_limit(
+            crate::residency::critical_commit(),
+            pressure,
+            limit.min(staging_cap),
+        );
         pool.reclaim(tick, staging_limit, true);
     }
 }
-
+fn default_spare_kept(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match vram_budget {
+        Some(b) if b <= 6 * GIB => 4,
+        Some(b) if b <= 12 * GIB => 16,
+        _ => SPARE_KEPT,
+    }
+}
+fn default_ripe_blocks(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match vram_budget {
+        Some(b) if b <= 6 * GIB => 2,
+        Some(b) if b <= 12 * GIB => 6,
+        _ => 12,
+    }
+}
+fn staging_spare_limit(critical: bool, pressure: bool, limit: usize) -> usize {
+    if critical {
+        0
+    } else if pressure {
+        1
+    } else {
+        limit
+    }
+}
+#[cfg(test)]
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    spares_for(memory, keep, SPARE_KEPT)
+}
+fn spares_for(memory: Option<[u64; 4]>, keep: bool, spare_kept: usize) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => spare_kept,
         _ => SPARE,
     }
 }
@@ -103,7 +128,17 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                let budget = crate::host::host()
+                    .and_then(|h| h.video_memory())
+                    .map(|[budget, ..]| budget);
+                default_ripe_blocks(budget)
+            })
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -787,6 +822,19 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+    #[test]
+    fn pool_defaults_scale_for_low_vram_and_commit_limits() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_spare_kept(Some(4 * GIB)), 4);
+        assert_eq!(default_spare_kept(Some(8 * GIB)), 16);
+        assert_eq!(default_spare_kept(Some(16 * GIB)), SPARE_KEPT);
+        assert_eq!(default_ripe_blocks(Some(4 * GIB)), 2);
+        assert_eq!(default_ripe_blocks(Some(8 * GIB)), 6);
+        assert_eq!(default_ripe_blocks(Some(16 * GIB)), 12);
+        assert_eq!(staging_spare_limit(true, true, 8), 0);
+        assert_eq!(staging_spare_limit(false, true, 8), 1);
+        assert_eq!(staging_spare_limit(false, false, 2), 2);
     }
 
     #[test]

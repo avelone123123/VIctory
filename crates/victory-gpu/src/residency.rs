@@ -121,15 +121,19 @@ pub(crate) fn limited_host_ram() -> bool {
     })
 }
 
+#[cfg(test)]
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    next_pressure_for(was, physical, commit, 32 * GIB)
+}
+fn next_pressure_for(was: bool, physical: u64, commit: u64, total_phys: u64) -> bool {
+    let small = total_phys <= 20 * GIB;
+    let (enter_phys, exit_phys) = if small { (4 * GIB, 5500 * MIB) } else { (3 * GIB, 5 * GIB) };
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < exit_phys || commit < 6 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= enter_phys || commit <= 4 * GIB
     }
 }
-
-/// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
     if !on() {
         return;
@@ -138,7 +142,7 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure_for(was, physical, commit, status.ullTotalPhys);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -217,6 +221,9 @@ mod tests {
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
         assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(next_pressure_for(false, 4 * GIB, 10 * GIB, 16 * GIB));
+        assert!(next_pressure_for(true, 5 * GIB, 10 * GIB, 16 * GIB));
+        assert!(!next_pressure_for(true, 5500 * MIB, 6 * GIB, 16 * GIB));
     }
 
     #[test]
